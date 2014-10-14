@@ -4,16 +4,22 @@
   <meta charset="utf-8">
   <title>video.js HLS Plugin Example</title>
 
-  <link href="node_modules/video.js/dist/video-js/video-js.css" rel="stylesheet">
+  <link href="libs/video-js/video-js.css" rel="stylesheet">
   
-  <!-- video.js -->
-  <script src="node_modules/video.js/dist/video-js/video.js"></script>
+  <!-- video.js -->	
+  <script src="libs/video-js/video.js"></script>
 
-  <!-- Media Sources plugin -->
-  <script src="node_modules/videojs-contrib-media-sources/src/videojs-media-sources.js"></script>
-
+  <script src="libs/jdataview.js"></script>
+  <script src="libs/jbinary.js"></script>
+  <script src="libs/mpegts_to_mp4/mpegts.js"></script>
+  <script src="libs/mpegts_to_mp4/mp4.js"></script>
+  <script src="libs/mpegts_to_mp4/h264.js"></script>
+  <script src="libs/mpegts_to_mp4/pes.js"></script>
+  <script src="libs/mpegts_to_mp4/adts.js"></script>
+  <script src="libs/mpegts_to_mp4/index.js"></script>
+  
   <!-- HLS plugin -->
-  <script src="src/videojs-hls.js"></script>
+  <script src="src/videojs-hls-html5.js"></script>
 
   <!-- segment handling -->
   <script src="src/xhr.js"></script>
@@ -28,7 +34,7 @@
   <script src="src/m3u8/m3u8-parser.js"></script>
   <script src="src/playlist-loader.js"></script>
 
-  <script src="node_modules/pkcs7/dist/pkcs7.unpad.js"></script>
+  <script src="libs/pkcs7.unpad.js"></script>
   <script src="src/decrypter.js"></script>
 
   <script src="src/bin-utils.js"></script>
@@ -55,21 +61,17 @@
 
 </head>
 <body>
-  <div class="info">
-    <p>The video below is an <a href="https://developer.apple.com/library/ios/documentation/networkinginternet/conceptual/streamingmediaguide/Introduction/Introduction.html#//apple_ref/doc/uid/TP40008332-CH1-SW1">HTTP Live Stream</a>. On desktop browsers other than Safari, the HLS plugin will polyfill support for the format on top of the video.js Flash tech.</p>
-    <p>Due to security restrictions in Flash, you will have to load this page over HTTP(S) to see the example in action.</p>
-  </div>
   <video id="video"
          class="video-js vjs-default-skin"
          height="300"
          width="600"
          controls>
     <source
-       src="http://solutions.brightcove.com/jwhisenant/hls/apple/bipbop/bipbopall.m3u8"
+       src="http://d3sporhxbkob1v.cloudfront.net/bill/vod/sample-video/400k.m3u8"
        type="application/x-mpegURL">
   </video>
   <script>
-    videojs.options.flash.swf = 'node_modules/video.js/dist/video-js/video-js.swf';
+    videojs.options.flash.swf = 'libs/video-js/video-js.swf';
     // initialize the player
     var player = videojs('video');
   </script>

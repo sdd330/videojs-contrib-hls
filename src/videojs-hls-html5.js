@@ -15,13 +15,13 @@ var
   keyXhr,
   keyFailed,
   resolveUrl;
-
+	
 // returns true if a key has failed to download within a certain amount of retries
 keyFailed = function(key) {
   return key.retries && key.retries >= 2;
 };
 
-videojs.Hls = videojs.Flash.extend({
+videojs.Hls = videojs.Html5.extend({
   init: function(player, options, ready) {
     var
       source = options.source,
@@ -29,10 +29,10 @@ videojs.Hls = videojs.Flash.extend({
 
     player.hls = this;
     delete options.source;
-    options.swf = settings.flash.swf;
-    videojs.Flash.call(this, player, options, ready);
+    videojs.Html5.call(this, player, options, ready);
     options.source = source;
     this.bytesReceived = 0;
+
 
     // TODO: After video.js#1347 is pulled in remove these lines
     this.currentTime = videojs.Hls.prototype.currentTime;
@@ -66,10 +66,10 @@ videojs.Hls.prototype.src = function(src) {
 
   this.src_ = src;
 
-  mediaSource = new videojs.MediaSource();
+  mediaSource = new window.MediaSource();
   source = {
-    src: videojs.URL.createObjectURL(mediaSource),
-    type: "video/flv"
+    src: window.URL.createObjectURL(mediaSource),
+    type: 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'
   };
   this.mediaSource = mediaSource;
 
@@ -85,7 +85,8 @@ videojs.Hls.prototype.src = function(src) {
     if (!tech.el()) {
       return;
     }
-    tech.el().vjs_src(source.src);
+
+    tech.el().src = source.src;
   });
 };
 
@@ -94,15 +95,15 @@ videojs.Hls.prototype.handleSourceOpen = function() {
   var
     player = this.player(),
     settings = player.options().hls || {},
-    sourceBuffer = this.mediaSource.addSourceBuffer('video/flv; codecs="vp6,aac"'),
+    sourceBuffer = this.mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E, mp4a.40.2"'),
     oldMediaPlaylist;
 
   this.sourceBuffer = sourceBuffer;
-  sourceBuffer.appendBuffer(this.segmentParser_.getFlvHeader());
+  //sourceBuffer.appendBuffer(this.segmentParser_.getFlvHeader());
 
   this.mediaIndex = 0;
   this.playlists = new videojs.Hls.PlaylistLoader(this.src_, settings.withCredentials);
-
+  
   this.playlists.on('loadedmetadata', videojs.bind(this, function() {
     oldMediaPlaylist = this.playlists.media();
 
@@ -163,8 +164,8 @@ videojs.Hls.prototype.play = function() {
     this.mediaIndex = 0;
   }
 
-  // delegate back to the Flash implementation
-  return videojs.Flash.prototype.play.apply(this, arguments);
+  // delegate back to the Html5 implementation
+  return videojs.Html5.prototype.play.apply(this, arguments);
 };
 
 videojs.Hls.prototype.currentTime = function() {
@@ -172,10 +173,10 @@ videojs.Hls.prototype.currentTime = function() {
     return this.lastSeekedTime_;
   }
   // currentTime is zero while the tech is initializing
-  if (!this.el() || !this.el().vjs_getProperty) {
+  if (!this.el()) {
     return 0;
   }
-  return this.el().vjs_getProperty('currentTime');
+  return this.el().currentTime;
 };
 
 videojs.Hls.prototype.setCurrentTime = function(currentTime) {
@@ -276,7 +277,7 @@ videojs.Hls.prototype.dispose = function() {
 
   this.resetSrc_();
 
-  videojs.Flash.prototype.dispose.call(this);
+  videojs.Html5.prototype.dispose.call(this);
 };
 
 /**
@@ -366,7 +367,6 @@ videojs.Hls.prototype.fillBuffer = function(offset) {
     bufferedTime = 0,
     segment,
     segmentUri;
-
 console.log("fillBuffer");
   // if there is a request already in flight, do nothing
   if (this.segmentXhr_) {
@@ -476,16 +476,11 @@ videojs.Hls.prototype.drainBuffer = function(event) {
     mediaIndex,
     playlist,
     offset,
-    tags,
     bytes,
     segment,
-
-    ptsTime,
     segmentOffset,
     segmentBuffer = this.segmentBuffer_;
-    
-console.log("fillBuffer");
-
+console.log("drainBuffer");
   if (!segmentBuffer.length) {
     return;
   }
@@ -527,43 +522,14 @@ console.log("fillBuffer");
     }
     this.sourceBuffer.abort();
     // tell the SWF where playback is continuing in the stitched timeline
-    this.el().vjs_setProperty('currentTime', segmentOffset * 0.001);
+    this.el().currentTime = segmentOffset * 0.001;
   }
-
-  // transmux the segment data from MP2T to FLV
+  
+  // TODO: convert the segment data from MP2T to MP4
   this.segmentParser_.parseSegmentBinaryData(bytes);
-  this.segmentParser_.flushTags();
-
-  tags = [];
-  while (this.segmentParser_.tagsAvailable()) {
-    tags.push(this.segmentParser_.getNextTag());
-  }
-
-  // if we're refilling the buffer after a seek, scan through the muxed
-  // FLV tags until we find the one that is closest to the desired
-  // playback time
-  if (typeof offset === 'number') {
-    ptsTime = offset - segmentOffset + tags[0].pts;
-
-    while (tags[i].pts < ptsTime) {
-      i++;
-    }
-
-    // tell the SWF where we will be seeking to
-    this.el().vjs_setProperty('currentTime', (tags[i].pts - tags[0].pts + segmentOffset) * 0.001);
-
-    tags = tags.slice(i);
-
-    this.lastSeekedTime_ = null;
-  }
-
-  for (i = 0; i < tags.length; i++) {
-    // queue up the bytes to be appended to the SourceBuffer
-    // the queue gives control back to the browser between tags
-    // so that large segments don't cause a "hiccup" in playback
-
-    this.sourceBuffer.appendBuffer(tags[i].bytes, this.player());
-  }
+  // Does not work
+  // this.sourceBuffer.appendBuffer(this.segmentParser_.getBytes());
+  // 
 
   // we're done processing this segment
   segmentBuffer.shift();
@@ -630,12 +596,7 @@ videojs.Hls.supportsNativeHls = (function() {
     video = document.createElement('video'),
     xMpegUrl,
     vndMpeg;
-
-  // native HLS is definitely not supported if HTML5 video isn't
-  if (!videojs.Html5.isSupported()) {
-    return false;
-  }
-
+	
   xMpegUrl = video.canPlayType('application/x-mpegURL');
   vndMpeg = video.canPlayType('application/vnd.apple.mpegURL');
   return (/probably|maybe/).test(xMpegUrl) ||
@@ -646,10 +607,8 @@ videojs.Hls.isSupported = function() {
 
   // Only use the HLS tech if native HLS isn't available
   return !videojs.Hls.supportsNativeHls &&
-    // Flash must be supported for the fallback to work
-    videojs.Flash.isSupported() &&
-    // Media sources must be available to stream bytes to Flash
-    videojs.MediaSource &&
+    // Media sources must be available to stream bytes to Html5
+    window.MediaSource && window.URL &&
     // Typed arrays are used to repackage the segments
     window.Uint8Array;
 };

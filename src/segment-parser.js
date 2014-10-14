@@ -1,6 +1,7 @@
 (function(window) {
   var
     videojs = window.videojs,
+    mp4bytes,
     FlvTag = videojs.Hls.FlvTag,
     H264Stream = videojs.Hls.H264Stream,
     AacStream = videojs.Hls.AacStream,
@@ -118,307 +119,504 @@
     };
 
     self.parseSegmentBinaryData = function(data) { // :ByteArray) {
-      var
-        dataPosition = 0,
-        dataSlice;
+      var mpegtsStream = new jBinary(data, MPEGTS);
+      var packets = mpegtsStream.read('File');
+        
+      // extracting and concatenating raw stream parts
+      stream = new jDataView(mpegtsStream.view.byteLength);
 
-      // To avoid an extra copy, we will stash overflow data, and only
-      // reconstruct the first packet. The rest of the packets will be
-      // parsed directly from data
-      if (streamBufferByteCount > 0) {
-        if (data.byteLength + streamBufferByteCount < MP2T_PACKET_LENGTH) {
-          // the current data is less than a single m2ts packet, so stash it
-          // until we receive more
-
-          // ?? this seems to append streamBuffer onto data and then just give up. I'm not sure why that would be interesting.
-          videojs.log('data.length + streamBuffer.length < MP2T_PACKET_LENGTH ??');
-          streamBuffer.readBytes(data, data.length, streamBuffer.length);
-          return;
-        } else {
-          // we have enough data for an m2ts packet
-          // process it immediately
-          dataSlice = data.subarray(0, MP2T_PACKET_LENGTH - streamBufferByteCount);
-          streamBuffer.set(dataSlice, streamBufferByteCount);
-
-          parseTSPacket(streamBuffer);
-
-          // reset the buffer
-          streamBuffer = new Uint8Array(MP2T_PACKET_LENGTH);
-          streamBufferByteCount = 0;
+      for (var i = 0, length = packets.length; i < length; i++) {
+        var packet = packets[i], adaptation = packet.adaptationField, payload = packet.payload;
+        if (payload && payload._rawStream) {
+          stream.writeBytes(payload._rawStream);
         }
       }
 
-      while (true) {
-        // Make sure we are TS aligned
-        while(dataPosition < data.byteLength  && data[dataPosition] !== 0x47) {
-          // If there is no sync byte skip forward until we find one
-          // TODO if we find a sync byte, look 188 bytes in the future (if
-          // possible). If there is not a sync byte there, keep looking
-          dataPosition++;
-        }
+      var pesStream = new jBinary(stream.slice(0, stream.tell()), PES),
+        audioStream = new jBinary(stream.byteLength, ADTS),
+        samples = [],
+        audioSamples = [];
+      
+      stream = new jDataView(stream.byteLength);
+      //"http://127.0.0.1:9999/video/test.m3u8"
 
-        // base case: not enough data to parse a m2ts packet
-        if (data.byteLength - dataPosition < MP2T_PACKET_LENGTH) {
-          if (data.byteLength - dataPosition > 0) {
-            // there are bytes remaining, save them for next time
-            streamBuffer.set(data.subarray(dataPosition),
-                             streamBufferByteCount);
-            streamBufferByteCount += data.byteLength - dataPosition;
-          }
-          return;
-        }
+      while (pesStream.tell() < pesStream.view.byteLength) {
+        var packet = pesStream.read('PESPacket');
+        if (packet.streamId === 0xC0) {
+          // 0xC0 means we have got first audio stream
+          audioStream.write('blob', packet.data);
+        } else
+        if (packet.streamId === 0xE0) {
+          var nalStream = new jBinary(packet.data, H264),
+            curSample = {offset: stream.tell(), pts: packet.pts, dts: packet.dts || packet.pts};
+          
+          samples.push(curSample);
+          
+          // collecting info from H.264 NAL units
+          while (nalStream.tell() < nalStream.view.byteLength) {
+            var nalUnit = nalStream.read('NALUnit');
+            switch (nalUnit[0] & 0x1F) {
+              case 7:
+                if (!sps) {
+                  var sps = nalUnit;
+                  var spsInfo = new jBinary(sps, H264).read('SPS');
+                  var width = (spsInfo.pic_width_in_mbs_minus_1 + 1) * 16;
+                  var height = (2 - spsInfo.frame_mbs_only_flag) * (spsInfo.pic_height_in_map_units_minus_1 + 1) * 16;
+                  var cropping = spsInfo.frame_cropping;
+                  if (cropping) {
+                    width -= 2 * (cropping.left + cropping.right);
+                    height -= 2 * (cropping.top + cropping.bottom);
+                  }
+                }
+                break;
 
-        // attempt to parse a m2ts packet
-        if (parseTSPacket(data.subarray(dataPosition, dataPosition + MP2T_PACKET_LENGTH))) {
-          dataPosition += MP2T_PACKET_LENGTH;
-        } else {
-          // If there was an error parsing a TS packet. it could be
-          // because we are not TS packet aligned. Step one forward by
-          // one byte and allow the code above to find the next
-          videojs.log('error parsing m2ts packet, attempting to re-align');
-          dataPosition++;
-        }
-      }
-    };
+              case 8:
+                if (!pps) {
+                  var pps = nalUnit;
+                }
+                break;
 
-    /**
-     * Parses a video/mp2t packet and appends the underlying video and
-     * audio data onto h264stream and aacStream, respectively.
-     * @param data {Uint8Array} the bytes of an MPEG2-TS packet,
-     * including the sync byte.
-     * @return {boolean} whether a valid packet was encountered
-     */
-    // TODO add more testing to make sure we dont walk past the end of a TS
-    // packet!
-    parseTSPacket = function(data) { // :ByteArray):Boolean {
-      var
-        offset = 0, // :uint
-        end = offset + MP2T_PACKET_LENGTH, // :uint
-
-        // Payload Unit Start Indicator
-        pusi = !!(data[offset + 1] & 0x40), // mask: 0100 0000
-
-        // packet identifier (PID), a unique identifier for the elementary
-        // stream this packet describes
-        pid = (data[offset + 1] & 0x1F) << 8 | data[offset + 2], // mask: 0001 1111
-
-        // adaptation_field_control, whether this header is followed by an
-        // adaptation field, a payload, or both
-        afflag = (data[offset + 3] & 0x30 ) >>> 4,
-
-        patTableId, // :int
-        patCurrentNextIndicator, // Boolean
-        patSectionLength, // :uint
-
-        pesPacketSize, // :int,
-        dataAlignmentIndicator, // :Boolean,
-        ptsDtsIndicator, // :int
-        pesHeaderLength, // :int
-
-        pts, // :uint
-        dts, // :uint
-
-        pmtCurrentNextIndicator, // :Boolean
-        pmtProgramDescriptorsLength,
-        pmtSectionLength, // :uint
-
-        streamType, // :int
-        elementaryPID, // :int
-        ESInfolength; // :int
-
-      // Continuity Counter we could use this for sanity check, and
-      // corrupt stream detection
-      // cc = (data[offset + 3] & 0x0F);
-
-      // move past the header
-      offset += 4;
-
-      // if an adaption field is present, its length is specified by
-      // the fifth byte of the PES header. The adaptation field is
-      // used to specify some forms of timing and control data that we
-      // do not currently use.
-      if (afflag > 0x01) {
-        offset += data[offset] + 1;
-      }
-
-      // Handle a Program Association Table (PAT). PATs map PIDs to
-      // individual programs. If this transport stream was being used
-      // for television broadcast, a program would probably be
-      // equivalent to a channel. In HLS, it would be very unusual to
-      // create an mp2t stream with multiple programs.
-      if (0x0000 === pid) {
-        // The PAT may be split into multiple sections and those
-        // sections may be split into multiple packets. If a PAT
-        // section starts in this packet, PUSI will be true and the
-        // first byte of the playload will indicate the offset from
-        // the current position to the start of the section.
-        if (pusi) {
-          offset += 1 + data[offset];
-        }
-        patTableId = data[offset];
-
-        if (patTableId !== 0x00) {
-          videojs.log('the table_id of the PAT should be 0x00 but was' +
-                      patTableId.toString(16));
-        }
-
-        // the current_next_indicator specifies whether this PAT is
-        // currently applicable or is part of the next table to become
-        // active
-        patCurrentNextIndicator = !!(data[offset + 5] & 0x01);
-        if (patCurrentNextIndicator) {
-          // section_length specifies the number of bytes following
-          // its position to the end of this section
-          patSectionLength =  (data[offset + 1] & 0x0F) << 8 | data[offset + 2];
-          // move past the rest of the PSI header to the first program
-          // map table entry
-          offset += 8;
-
-          // we don't handle streams with more than one program, so
-          // raise an exception if we encounter one
-          // section_length = rest of header + (n * entry length) + CRC
-          // = 5 + (n * 4) + 4
-          if ((patSectionLength - 5 - 4) / 4 !== 1) {
-            throw new Error("TS has more that 1 program");
-          }
-
-          // the Program Map Table (PMT) associates the underlying
-          // video and audio streams with a unique PID
-          self.stream.pmtPid = (data[offset + 2] & 0x1F) << 8 | data[offset + 3];
-        }
-      } else if (pid === self.stream.programMapTable[STREAM_TYPES.h264] ||
-                 pid === self.stream.programMapTable[STREAM_TYPES.adts]) {
-        if (pusi) {
-          // comment out for speed
-          if (0x00 !== data[offset + 0] || 0x00 !== data[offset + 1] || 0x01 !== data[offset + 2]) {
-            // look for PES start code
-             throw new Error("PES did not begin with start code");
-           }
-
-          // var sid:int  = data[offset+3]; // StreamID
-          pesPacketSize = (data[offset + 4] << 8) | data[offset + 5];
-          dataAlignmentIndicator = (data[offset + 6] & 0x04) !== 0;
-          ptsDtsIndicator = data[offset + 7];
-          pesHeaderLength = data[offset + 8]; // TODO sanity check header length
-          offset += 9; // Skip past PES header
-
-          // PTS and DTS are normially stored as a 33 bit number.
-          // JavaScript does not have a integer type larger than 32 bit
-          // BUT, we need to convert from 90ns to 1ms time scale anyway.
-          // so what we are going to do instead, is drop the least
-          // significant bit (the same as dividing by two) then we can
-          // divide by 45 (45 * 2 = 90) to get ms.
-          if (ptsDtsIndicator & 0xC0) {
-            // the PTS and DTS are not written out directly. For information on
-            // how they are encoded, see
-            // http://dvd.sourceforge.net/dvdinfo/pes-hdr.html
-            pts = (data[offset + 0] & 0x0E) << 28
-              | (data[offset + 1] & 0xFF) << 21
-              | (data[offset + 2] & 0xFE) << 13
-              | (data[offset + 3] & 0xFF) <<  6
-              | (data[offset + 4] & 0xFE) >>>  2;
-            pts /= 45;
-            dts = pts;
-            if (ptsDtsIndicator & 0x40) {// DTS
-              dts = (data[offset + 5] & 0x0E ) << 28
-                | (data[offset + 6] & 0xFF ) << 21
-                | (data[offset + 7] & 0xFE ) << 13
-                | (data[offset + 8] & 0xFF ) << 6
-                | (data[offset + 9] & 0xFE ) >>> 2;
-              dts /= 45;
+              case 5:
+                curSample.isIDR = true;
+              /* falls through */
+              default:
+                stream.writeUint32(nalUnit.length);
+                stream.writeBytes(nalUnit);
             }
           }
-          // Skip past "optional" portion of PTS header
-          offset += pesHeaderLength;
-
-          if (pid === self.stream.programMapTable[STREAM_TYPES.h264]) {
-            h264Stream.setNextTimeStamp(pts,
-                                        dts,
-                                        dataAlignmentIndicator);
-          } else if (pid === self.stream.programMapTable[STREAM_TYPES.adts]) {
-            aacStream.setNextTimeStamp(pts,
-                                       pesPacketSize,
-                                       dataAlignmentIndicator);
-          }
         }
-
-        if (pid === self.stream.programMapTable[STREAM_TYPES.adts]) {
-          aacStream.writeBytes(data, offset, end - offset);
-        } else if (pid === self.stream.programMapTable[STREAM_TYPES.h264]) {
-          h264Stream.writeBytes(data, offset, end - offset);
-        }
-      } else if (self.stream.pmtPid === pid) {
-        // similarly to the PAT, jump to the first byte of the section
-        if (pusi) {
-          offset += 1 + data[offset];
-        }
-        if (data[offset] !== 0x02) {
-          videojs.log('The table_id of a PMT should be 0x02 but was ' +
-                      data[offset].toString(16));
-        }
-
-        // whether this PMT is currently applicable or is part of the
-        // next table to become active
-        pmtCurrentNextIndicator = !!(data[offset + 5] & 0x01);
-        if (pmtCurrentNextIndicator) {
-          // overwrite any existing program map table
-          self.stream.programMapTable = {};
-          // section_length specifies the number of bytes following
-          // its position to the end of this section
-          pmtSectionLength  = (data[offset + 1] & 0x0f) << 8 | data[offset + 2];
-          // subtract the length of the program info descriptors
-          pmtProgramDescriptorsLength = (data[offset + 10] & 0x0f) << 8 | data[offset + 11];
-          pmtSectionLength -= pmtProgramDescriptorsLength;
-          // skip CRC and PSI data we dont care about
-          // rest of header + CRC = 9 + 4
-          pmtSectionLength -= 13;
-
-          // align offset to the first entry in the PMT
-          offset += 12 + pmtProgramDescriptorsLength;
-
-          // iterate through the entries
-          while (0 < pmtSectionLength) {
-            // the type of data carried in the PID this entry describes
-            streamType = data[offset + 0];
-            // the PID for this entry
-            elementaryPID = (data[offset + 1] & 0x1F) << 8 | data[offset + 2];
-
-            if (streamType === STREAM_TYPES.h264) {
-              if (self.stream.programMapTable[streamType] &&
-                  self.stream.programMapTable[streamType] !== elementaryPID) {
-                throw new Error("Program has more than 1 video stream");
-              }
-              self.stream.programMapTable[streamType] = elementaryPID;
-            } else if (streamType === STREAM_TYPES.adts) {
-              if (self.stream.programMapTable[streamType] &&
-                  self.stream.programMapTable[streamType] !== elementaryPID) {
-                throw new Error("Program has more than 1 audio Stream");
-              }
-              self.stream.programMapTable[streamType] = elementaryPID;
-            }
-            // TODO add support for MP3 audio
-
-            // the length of the entry descriptor
-            ESInfolength = (data[offset + 3] & 0x0F) << 8 | data[offset + 4];
-            // move to the first byte after the end of this entry
-            offset += 5 + ESInfolength;
-            pmtSectionLength -=  5 + ESInfolength;
-          }
-        }
-        // We could test the CRC here to detect corruption with extra CPU cost
-      } else if (0x0011 === pid) {
-        // Service Description Table
-      } else if (0x1FFF === pid) {
-        // NULL packet
-      } else {
-        videojs.log("Unknown PID parsing TS packet: " + pid);
       }
+
+      samples.push({offset: stream.tell()});
+
+      var sizes = [],
+        dtsDiffs = [],
+        accessIndexes = [],
+        pts_dts_Diffs = [],
+        current = samples[0],
+        frameRate = {sum: 0, count: 0},
+        duration = 0;
+      
+      // calculating PTS/DTS differences and collecting keyframes
+      for (var i = 0, length = samples.length - 1; i < length; i++) {
+        var next = samples[i + 1];
+        sizes.push(next.offset - current.offset);
+        var dtsDiff = next.dts - current.dts;
+        if (dtsDiff) {
+          dtsDiffs.push({sample_count: 1, sample_delta: dtsDiff});
+          duration += dtsDiff;
+          frameRate.sum += dtsDiff;
+          frameRate.count++;
+        } else {
+          dtsDiffs.length++;
+        }
+        if (current.isIDR) {
+          accessIndexes.push(i + 1);
+        }
+        pts_dts_Diffs.push({
+          first_chunk: pts_dts_Diffs.length + 1,
+          sample_count: 1,
+          sample_offset: current.dtsFix = current.pts - current.dts
+        });
+        current = next;
+      }
+      
+      frameRate = frameRate.sum / frameRate.count;
+      
+      for (var i = 0, length = dtsDiffs.length; i < length; i++) {
+        if (dtsDiffs[i] === undefined) {
+          dtsDiffs[i] = {first_chunk: i + 1, sample_count: 1, sample_delta: frameRate};
+          duration += frameRate;
+          //samples[i + 1].dts = samples[i].dts + frameRate;
+        }
+      }
+      
+      // checking if DTS differences are same everywhere to pack them into one item
+      var dtsDiffsSame = true;
+      
+      for (var i = 1, length = dtsDiffs.length; i < length; i++) {
+        if (dtsDiffs[i].sample_delta !== dtsDiffs[0].sample_delta) {
+          dtsDiffsSame = false;
+          break;
+        }
+      }
+      
+      if (dtsDiffsSame) {
+        dtsDiffs = [{first_chunk: 1, sample_count: sizes.length, sample_delta: dtsDiffs[0].sample_delta}];
+      }
+
+      // building audio metadata
+      var audioStart = stream.tell(),
+        audioSize = audioStream.tell(),
+        audioSizes = [],
+        audioHeader,
+        maxAudioSize = 0;
+        
+      audioStream.seek(0);
+      
+      while (audioStream.tell() < audioSize) {
+        audioHeader = audioStream.read('ADTSPacket');
+        audioSizes.push(audioHeader.data.length);
+        if (audioHeader.data.length > maxAudioSize) {
+          maxAudioSize = audioHeader.data.length;
+        }
+        stream.writeBytes(audioHeader.data);
+      }
+
+      // generating resulting MP4
+      var mp4 = new jBinary(stream.byteLength, MP4);
+      
+      var trak = [{
+        atoms: {
+          tkhd: [{
+            version: 0,
+            flags: 15,
+            track_ID: 1,
+            duration: duration,
+            layer: 0,
+            alternate_group: 0,
+            volume: 1,
+            matrix: {
+              a: 1, b: 0, x: 0,
+              c: 0, d: 1, y: 0,
+              u: 0, v: 0, w: 1
+            },
+            dimensions: {
+              horz: width,
+              vert: height
+            }
+          }],
+          mdia: [{
+            atoms: {
+              mdhd: [{
+                version: 0,
+                flags: 0,
+                timescale: 90000,
+                duration: duration,
+                lang: 'und'
+              }],
+              hdlr: [{
+                version: 0,
+                flags: 0,
+                handler_type: 'vide',
+                name: 'VideoHandler'
+              }],
+              minf: [{
+                atoms: {
+                  vmhd: [{
+                    version: 0,
+                    flags: 1,
+                    graphicsmode: 0,
+                    opcolor: {r: 0, g: 0, b: 0}
+                  }],
+                  dinf: [{
+                    atoms: {
+                      dref: [{
+                        version: 0,
+                        flags: 0,
+                        entries: [{
+                          type: 'url ',
+                          version: 0,
+                          flags: 1,
+                          location: ''
+                        }]
+                      }]
+                    }
+                  }],
+                  stbl: [{
+                    atoms: {
+                      stsd: [{
+                        version: 0,
+                        flags: 0,
+                        entries: [{
+                          type: 'avc1',
+                          data_reference_index: 1,
+                          dimensions: {
+                            horz: width,
+                            vert: height
+                          },
+                          resolution: {
+                            horz: 72,
+                            vert: 72
+                          },
+                          frame_count: 1,
+                          compressorname: '',
+                          depth: 24,
+                          atoms: {
+                            avcC: [{
+                              version: 1,
+                              profileIndication: spsInfo.profile_idc,
+                              profileCompatibility: parseInt(spsInfo.constraint_set_flags.join(''), 2),
+                              levelIndication: spsInfo.level_idc,
+                              lengthSizeMinusOne: 3,
+                              seqParamSets: [sps],
+                              pictParamSets: [pps]
+                            }]
+                          }
+                        }]
+                      }],
+                      stts: [{
+                        version: 0,
+                        flags: 0,
+                        entries: dtsDiffs
+                      }],
+                      stss: [{
+                        version: 0,
+                        flags: 0,
+                        entries: accessIndexes
+                      }],
+                      ctts: [{
+                        version: 0,
+                        flags: 0,
+                        entries: pts_dts_Diffs
+                      }],
+                      stsc: [{
+                        version: 0,
+                        flags: 0,
+                        entries: [{
+                          first_chunk: 1,
+                          samples_per_chunk: sizes.length,
+                          sample_description_index: 1
+                        }]
+                      }],
+                      stsz: [{
+                        version: 0,
+                        flags: 0,
+                        sample_size: 0,
+                        sample_count: sizes.length,
+                        sample_sizes: sizes
+                      }],
+                      stco: [{
+                        version: 0,
+                        flags: 0,
+                        entries: [0x28]
+                      }]
+                    }
+                  }]
+                }
+              }]
+            }
+          }]
+        }
+      }];
+
+      if (audioSize > 0) {
+        trak.push({
+          atoms: {
+            tkhd: [{
+              version: 0,
+              flags: 15,
+              track_ID: 2,
+              duration: duration,
+              layer: 0,
+              alternate_group: 1,
+              volume: 1,
+              matrix: {
+                a: 1, b: 0, x: 0,
+                c: 0, d: 1, y: 0,
+                u: 0, v: 0, w: 1
+              },
+              dimensions: {
+                horz: 0,
+                vert: 0
+              }
+            }],
+            mdia: [{
+              atoms: {
+                mdhd: [{
+                  version: 0,
+                  flags: 0,
+                  timescale: 90000,
+                  duration: duration,
+                  lang: 'eng'
+                }],
+                hdlr: [{
+                  version: 0,
+                  flags: 0,
+                  handler_type: 'soun',
+                  name: 'SoundHandler'
+                }],
+                minf: [{
+                  atoms: {
+                    smhd: [{
+                      version: 0,
+                      flags: 0,
+                      balance: 0
+                    }],
+                    dinf: [{
+                      atoms: {
+                        dref: [{
+                          version: 0,
+                          flags: 0,
+                          entries: [{
+                            type: 'url ',
+                            version: 0,
+                            flags: 1,
+                            location: ''
+                          }]
+                        }]
+                      }
+                    }],
+                    stbl: [{
+                      atoms: {
+                        stsd: [{
+                          version: 0,
+                          flags: 0,
+                          entries: [{
+                            type: 'mp4a',
+                            data_reference_index: 1,
+                            channelcount: 2,
+                            samplesize: 16,
+                            samplerate: 22050,
+                            atoms: {
+                              esds: [{
+                                version: 0,
+                                flags: 0,
+                                sections: [
+                                  {
+                                    descriptor_type: 3,
+                                    ext_type: 128,
+                                    length: 34,
+                                    es_id: 2,
+                                    stream_priority: 0
+                                  },
+                                  {
+                                    descriptor_type: 4,
+                                    ext_type: 128,
+                                    length: 20,
+                                    type: 'mpeg4_audio',
+                                    stream_type: 'audio',
+                                    upstream_flag: 0,
+                                    buffer_size: 0,
+                                    maxBitrate: Math.round(maxAudioSize / (duration / 90000 / audioSizes.length)),
+                                    avgBitrate: Math.round((stream.tell() - audioStart) / (duration / 90000))
+                                  },
+                                  {
+                                    descriptor_type: 5,
+                                    ext_type: 128,
+                                    length: 2,
+                                    audio_profile: audioHeader.profileMinusOne + 1,
+                                    sampling_freq: audioHeader.samplingFreq,
+                                    channelConfig: audioHeader.channelConfig
+                                  },
+                                  {
+                                    descriptor_type: 6,
+                                    ext_type: 128,
+                                    length: 1,
+                                    sl: 2
+                                  }
+                                ]
+                              }]
+                            }
+                          }]
+                        }],
+                        stts: [{
+                          version: 0,
+                          flags: 0,
+                          entries: [{
+                            sample_count: audioSizes.length,
+                            sample_delta: Math.round(duration / audioSizes.length)
+                          }]
+                        }],
+                        stsc: [{
+                          version: 0,
+                          flags: 0,
+                          entries: [{
+                            first_chunk: 1,
+                            samples_per_chunk: audioSizes.length,
+                            sample_description_index: 1
+                          }]
+                        }],
+                        stsz: [{
+                          version: 0,
+                          flags: 0,
+                          sample_size: 0,
+                          sample_count: audioSizes.length,
+                          sample_sizes: audioSizes
+                        }],
+                        stco: [{
+                          version: 0,
+                          flags: 0,
+                          entries: [0x28 + audioStart]
+                        }]
+                      }
+                    }]
+                  }
+                }]
+              }
+            }]
+          }
+        });
+      };
+      
+      var creationTime = new Date();
+
+      mp4.write('File', {
+        ftyp: [{
+          major_brand: 'isom',
+          minor_version: 512,
+          compatible_brands: ['isom', 'iso2', 'avc1', 'mp41']
+        }],
+        mdat: [{
+          _rawData: stream.getBytes(stream.tell(), 0)
+        }],
+        moov: [{
+          atoms: {
+            mvhd: [{
+              version: 0,
+              flags: 0,
+              creation_time: creationTime,
+              modification_time: creationTime,
+              timescale: 90000,
+              duration: duration,
+              rate: 1,
+              volume: 1,
+              matrix: {
+                a: 1, b: 0, x: 0,
+                c: 0, d: 1, y: 0,
+                u: 0, v: 0, w: 1
+              },
+              next_track_ID: 2
+            }],
+            trak: trak
+          }
+        }]
+      });
+    
+      var video = document.createElement('video'), source = document.createElement('source');
+      document.body.appendChild(video);
+    
+    /*
+    mp4bytes = mp4.view.getBytes(mp4.view.byteLength, 0);
+        function onSourceOpen(videoTag, e) {
+          var mediaSource = e.target;
+          //var sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.4d401f,mp4a.40.2"');
+          var sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="mp4a.40.2"');
+          sourceBuffer.appendBuffer(mp4bytes);
+          alert('done');
+        }
+
+        var mediaSource = new MediaSource();
+        mediaSource.addEventListener('sourceopen', onSourceOpen.bind(this, video));
+        video.src = window.URL.createObjectURL(mediaSource);
+    */
+
+    source.type = 'video/mp4';
+    video.appendChild(source);
+    video.src = source.src = mp4.toURI('video/mp4');
+    video.load();
+    video.play();
+
 
       return true;
     };
 
     self.getTags = function() {
       return h264Stream.tags;
+    };
+
+    self.getBytes = function() {
+      return mp4bytes;
     };
 
     self.stats = {
