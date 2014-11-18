@@ -31,6 +31,7 @@ videojs.Hls = videojs.Html5.extend({
     delete options.source;
     videojs.Html5.call(this, player, options, ready);
     options.source = source;
+
     this.bytesReceived = 0;
 
     // TODO: After video.js#1347 is pulled in remove these lines
@@ -65,17 +66,13 @@ videojs.Hls.prototype.src = function(src) {
 
   this.src_ = src;
 
-  mediaSource = new window.MediaSource();
+  mediaSource = new videojs.MediaSource();
   source = {
-    src: window.URL.createObjectURL(mediaSource),
-    type: 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'
+    src: videojs.URL.createObjectURL(mediaSource),
+    type: 'video/mp4'
   };
   this.mediaSource = mediaSource;
-
   this.segmentBuffer_ = [];
-  this.segmentCache_ = [];
-  this.segmentParser_ = new videojs.Hls.SegmentParser();
-
   // load the MediaSource into the player
   this.mediaSource.addEventListener('sourceopen', videojs.bind(this, this.handleSourceOpen));
 
@@ -86,7 +83,8 @@ videojs.Hls.prototype.src = function(src) {
       return;
     }
 
-    tech.el().src = source.src;
+    videojs.MediaSource.open(source.src, tech.el().id);
+    //tech.el().src = source.src;
   });
 };
 
@@ -479,7 +477,6 @@ videojs.Hls.prototype.drainBuffer = function(event) {
     segment,
     segmentOffset,
     segmentBuffer = this.segmentBuffer_,
-    segmentCache = this.segmentCache_,
     tech = this;
 
   if (!segmentBuffer.length) {
@@ -522,49 +519,18 @@ videojs.Hls.prototype.drainBuffer = function(event) {
       return;
     }
     this.sourceBuffer.abort();
-    // tell the SWF where playback is continuing in the stitched timeline
     this.el().currentTime = segmentOffset * 0.001;
   }
   
-  // TODO: convert the segment data from MP2T to MP4
-  this.segmentParser_.parseSegmentBinaryData(bytes, function(url){
-    // Does not work
-    // this.sourceBuffer.appendBuffer(this.segmentParser_.getMP4Bin())
-    var video = document.createElement('video'), source = document.createElement('source');
-    video.id = "segment" + mediaIndex;
-    source.type = 'video/mp4';
-    video.appendChild(source);
-    video.src = source.src = url
-    video.load();
-    segmentCache.push(video);
+  this.sourceBuffer.appendBuffer(bytes);
+  // we're done processing this segment
+  segmentBuffer.shift();
 
-    if(mediaIndex === 0){
-      var playerElement = tech.el();
-      playerElement.src = url;
-      playerElement.segmentId = 0;
-      playerElement.load();
-      playerElement.addEventListener('ended', function () {
-        console.log("ended");
-        /*
-        var naxtSegmentId = playerElement.segmentId + 1;
-        var segmentVideo = this.segmentCache[naxtSegmentId];
-        if(segmentVideo){
-          playerElement.src = segmentVideo.src;
-          playerElement.load();
-          playerElement.play();
-        }*/
-      });
-    }
-
-    // we're done processing this segment
-    segmentBuffer.shift();
-
-    // transition the sourcebuffer to the ended state if we've hit the end of
-    // the playlist
-    if (mediaIndex + 1 === playlist.segments.length) {
-      this.mediaSource.endOfStream();
-    }
-  });
+  // transition the sourcebuffer to the ended state if we've hit the end of
+  // the playlist
+  if (mediaIndex + 1 === playlist.segments.length) {
+    this.mediaSource.endOfStream();
+  }
 };
 
 videojs.Hls.prototype.fetchKeys = function(playlist, index) {

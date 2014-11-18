@@ -367,7 +367,6 @@ videojs.Hls.prototype.fillBuffer = function(offset) {
     segment,
     segmentUri;
 
-console.log("fillBuffer");
   // if there is a request already in flight, do nothing
   if (this.segmentXhr_) {
     return;
@@ -483,8 +482,6 @@ videojs.Hls.prototype.drainBuffer = function(event) {
     ptsTime,
     segmentOffset,
     segmentBuffer = this.segmentBuffer_;
-    
-console.log("fillBuffer");
 
   if (!segmentBuffer.length) {
     return;

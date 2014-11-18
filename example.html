@@ -9,8 +9,15 @@
   <!-- video.js -->	
   <script src="libs/video-js/video.js"></script>
 
+  <!-- dash.js --> 
+  <script src="libs/dash.all.js"></script>
+  <script src="libs/videojs-tech-dashjs.js"></script>
+
   <!-- HLS plugin -->
+  <script src="src/videojs-media-sources.js"></script>
   <script src="src/videojs-hls-html5.js"></script>
+  
+
 
   <!-- segment handling -->
   <script src="src/xhr.js"></script>
@@ -54,17 +61,30 @@
 <body>
   <video id="video"
          class="video-js vjs-default-skin"
-         height="300"
-         width="600"
-         controls>
-    <source
+         height="224"
+         width="400" controls>
+    <!--source
        src="http://d3sporhxbkob1v.cloudfront.net/bill/vod/sample-video/400k.m3u8"
-       type="application/x-mpegURL">
+       type="application/x-mpegURL"-->
+    <!--source src="http://127.0.0.1:9999/video/football/manifest.mpd" type='application/dash+xml'-->
+    <source src="http://127.0.0.1:8080/sample/400k.m3u8" type="application/x-mpegURL">
   </video>
+  <button id="btnPlay" onclick="play()">Play</button>
+  <button id="btnPause" onclick="pause()">Pause</button>
   <script>
     videojs.options.flash.swf = 'libs/video-js/video-js.swf';
     // initialize the player
     var player = videojs('video');
+    //var player = videojs('video', {context:new Dash.di.DashContext()});
+
+    function play(){
+      player.play();
+    }
+
+    function pause(){
+      player.pause();
+    }
+
   </script>
 </body>
 </html>

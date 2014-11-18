@@ -5,22 +5,35 @@ importScripts('../libs/require.js');
 require.config({
 	paths: {
 		jdataview: '../libs/jdataview',
-		jbinary: '../libs/jbinary',
-		consoleTime: '../libs/shim/console.time',
-		consoleWorker: '../libs/shim/console.worker'
+		jbinary: '../libs/jbinary'
 	}
 });
 
 require(['jbinary', '../libs/mpegts_to_mp4/mpegts', '../libs/mpegts_to_mp4/index'],
 	function (jBinary, MPEGTS, mpegts_to_mp4) {
-		addEventListener('message', function (event) {
-			var mpegts = new jBinary(event.data, MPEGTS);
-			var mp4 = mpegts_to_mp4(mpegts);
+        var eventList = [];
+        var processing = false;
 
-			postMessage({
-				type: 'video',
-				url: mp4.toURI('video/mp4')
-			});
+        function processEvent(){
+            if(!processing && eventList.length > 0){
+                processing = true;
+                var event = eventList.shift();
+                var mediaData = event.data.mediaData;
+                var mediaIndex = event.data.mediaIndex;
+                var mpegts = new jBinary(mediaData, MPEGTS);
+                var mp4 = mpegts_to_mp4(mpegts);
+                postMessage({
+                    type: 'video',
+                    mediaIndex: mediaIndex,
+                    url: mp4.toURI('video/mp4')
+                });
+                processing = false;
+            }
+        }
+
+		addEventListener('message', function (event) {
+            eventList.push(event);
+            processEvent();
 		});
 
 		postMessage({type: 'ready'});
